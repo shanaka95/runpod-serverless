@@ -3,56 +3,117 @@ import base64
 from io import BytesIO
 
 import torch
-from diffusers import FluxPipeline
 import runpod
+from diffusers import FluxPipeline
 
-# Load once per worker (cold-start cost amortised across all jobs in the worker lifetime).
-# CPU offload keeps VRAM low enough for 24GB consumer cards while remaining fast on
-# 40GB+ A100/H100 workers. xformers is best-effort — falls back to sdpa if unavailable.
+# -----------------------------------------------------------------------------
+# Configuration
+# -----------------------------------------------------------------------------
+
+MODEL_ID = os.getenv("MODEL_ID", "black-forest-labs/FLUX.1-dev")
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+DTYPE = torch.bfloat16 if DEVICE == "cuda" else torch.float32
+
+print(f"Loading {MODEL_ID}...")
+print(f"Device: {DEVICE}")
+
+# -----------------------------------------------------------------------------
+# Load model ONCE (cold start only)
+# -----------------------------------------------------------------------------
+
 pipe = FluxPipeline.from_pretrained(
-    "black-forest-labs/FLUX.1-dev",
-    torch_dtype=torch.bfloat16,
+    MODEL_ID,
+    torch_dtype=DTYPE,
+    use_safetensors=True,
 )
-pipe.enable_model_cpu_offload()
-try:
-    pipe.enable_xformers_memory_efficient_attention()
-except Exception:
-    pass  # ponytail: xformers not installed / incompatible, diffusers will fall back
 
+if DEVICE == "cuda":
+    pipe.enable_model_cpu_offload()
+
+    try:
+        pipe.enable_xformers_memory_efficient_attention()
+        print("xFormers enabled.")
+    except Exception:
+        print("xFormers not available, using SDPA.")
+
+print("Model loaded successfully.")
+
+# -----------------------------------------------------------------------------
+# Handler
+# -----------------------------------------------------------------------------
 
 def handler(job):
-    job_input = job.get("input") or {}
+    job_input = job["input"]
 
     prompt = job_input.get("prompt")
+
     if not prompt:
-        return {"error": "A 'prompt' is required in the input."}
+        return {
+            "error": "Missing required field: prompt"
+        }
 
     seed = int(job_input.get("seed", 0))
-    steps = int(job_input.get("num_inference_steps", 28))
-    guidance_scale = float(job_input.get("guidance_scale", 3.5))
     width = int(job_input.get("width", 1024))
     height = int(job_input.get("height", 1024))
+    steps = int(job_input.get("num_inference_steps", 28))
+    guidance = float(job_input.get("guidance_scale", 3.5))
 
-    # Clamp to multiples of 8 — FLUX rejects awkward strides.
+    # FLUX requires multiples of 8
     width = max(64, (width // 8) * 8)
     height = max(64, (height // 8) * 8)
 
+    runpod.serverless.progress_update(job, "Generating image...")
+
+    generator = torch.Generator(device=DEVICE).manual_seed(seed)
+
     with torch.inference_mode():
-        image = pipe(
-            prompt=prompt,
-            height=height,
-            width=width,
-            guidance_scale=guidance_scale,
-            num_inference_steps=steps,
-            max_sequence_length=512,
-            generator=torch.Generator("cuda").manual_seed(seed),
-        ).images[0]
 
-    buffered = BytesIO()
-    image.save(buffered, format="PNG")
-    image_base64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
+        if DEVICE == "cuda":
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                image = pipe(
+                    prompt=prompt,
+                    width=width,
+                    height=height,
+                    guidance_scale=guidance,
+                    num_inference_steps=steps,
+                    max_sequence_length=512,
+                    generator=generator,
+                ).images[0]
+        else:
+            image = pipe(
+                prompt=prompt,
+                width=width,
+                height=height,
+                guidance_scale=guidance,
+                num_inference_steps=steps,
+                max_sequence_length=512,
+                generator=generator,
+            ).images[0]
 
-    return {"image_base64": image_base64, "seed": seed, "size": [width, height]}
+    buffer = BytesIO()
+    image.save(buffer, format="PNG")
+
+    image_b64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+
+    return {
+        "image_base64": image_b64,
+        "seed": seed,
+        "width": width,
+        "height": height,
+        "steps": steps,
+        "guidance_scale": guidance,
+    }
 
 
-runpod.serverless.start({"handler": handler})
+# -----------------------------------------------------------------------------
+# Start worker
+# -----------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    runpod.serverless.start(
+        {
+            "handler": handler
+        }
+    )
