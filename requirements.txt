@@ -1,0 +1,11 @@
+runpod~=1.7.6
+torch==2.0.1
+pillow==9.5.0
+transformers==4.30.2
+diffusers
+accelerate
+huggingface_hub
+safetensors
+sentencepiece
+protobuf
+xformers
