@@ -1,7 +1,7 @@
-runpod~=1.7.6
-torch==2.0.1
-pillow==9.5.0
-transformers==4.30.2
+runpod
+torch
+pillow
+transformers
 diffusers
 accelerate
 huggingface_hub
